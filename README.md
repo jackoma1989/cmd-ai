@@ -1,8 +1,20 @@
-# cmd-ai
+# cmd-ai (Enhanced Fork)
+
+> **Upstream Attribution / 致谢与引用声明**
+> This repository is an enhanced fork of [**BrodaNoel/cmd-ai**](https://github.com/BrodaNoel/cmd-ai) originally created by **Broda Noel** under the MIT License.
+>
+> **Enhancements in this fork:**
+> - **Custom OpenAI-Compatible & Proxy Providers (`custom`, `minimax`, `antigravity`)**: Support any standard `/v1/chat/completions` endpoint, custom model names, and `reasoning_effort` parameters without hardcoded whitelist resets.
+> - **Single-Key Instant Approval**: Uses terminal raw mode so pressing `Enter` (or `Space` / `y`) immediately executes the command, and pressing `n` or `Esc` cancels instantly without needing `Y + Enter`.
+> - **Clean Streaming Output**: Removed redundant wrapper headers (`AI Response`, `--- Proposed Command ---`, `Executing command...`, `Stdout:`) and switched to streaming `spawn` execution for real-time output.
+> - **Session-Isolated Multi-Turn Context**: Automatically captures terminal output (`stdout`/`stderr`) and passes the last **10 turns** of conversation + terminal results within the same shell window (`process.ppid`) as context. Opening a new terminal window starts with a clean context automatically, or run `ai clear` / `ai reset` anytime.
+> - **Windows PowerShell & CMD Native Detection**: Automatically detects `PowerShell` vs `cmd.exe` on Windows and executes commands in the matching shell.
+
+---
 
 **cmd-ai** is a natural language shell assistant powered by AI. It turns plain English (or any prompt) into real, executable shell commands — with safety, explanation, history, and autocompletion built-in.
 
-By default, it uses **Ollama** (local models on your machine), and you can also configure it to use **OpenAI**, **Google Gemini**, or **Anthropic Claude** APIs.
+By default, it supports **Custom OpenAI-Compatible APIs**, **MiniMax**, **Ollama** (local models on your machine), **OpenAI**, **Google Gemini**, and **Anthropic Claude** APIs.
 
 ![Example Usage](example.png)
 
@@ -64,6 +76,7 @@ ai [your task here] [--flags]
 ai list all running Docker containers
 ai remove all .DS_Store files recursively
 ai config                         # Configure provider/model/API key/reasoning effort
+ai clear                          # Clear conversation & output context for current terminal window
 ai history                        # View past commands
 ai man                            # Show help
 ai install-autocomplete           # Automatically set up autocomplete
@@ -257,9 +270,10 @@ ai history
 
 This project is licensed under the MIT License.
 
-## Author
+## Author & Credits
 
-Made by Broda Noel (brodanoel@gmail.com)
+- **Original Author:** Made by [Broda Noel](https://github.com/BrodaNoel) (brodanoel@gmail.com) — [BrodaNoel/cmd-ai](https://github.com/BrodaNoel/cmd-ai)
+- **Fork Enhancements:** Maintained by [jackoma1989](https://github.com/jackoma1989)
 
 ## ⚠️ Disclaimer
 

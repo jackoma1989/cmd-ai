@@ -5,7 +5,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import readline from 'readline';
-import { exec, execFile } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
@@ -32,7 +32,16 @@ const LEGACY_CONFIG_PATH = path.join(HOME_DIR, '.ai-config.json');
 const LEGACY_HISTORY_PATH = path.join(HOME_DIR, '.ai-command-history.json');
 const LEGACY_AUTOCOMPLETE_PATH = path.join(HOME_DIR, '.cmd-ai-completion.sh');
 
-const PROVIDERS = ['ollama', 'openai', 'gemini', 'claude'];
+const PROVIDERS = ['custom', 'minimax', 'antigravity', 'ollama', 'openai', 'gemini', 'claude'];
+
+const MINIMAX_MODELS = ['MiniMax-M3.1-Flash-Preview'];
+
+const ANTIGRAVITY_MODELS = [
+  'gemini-3.8-flash',
+  'gemini-4-argon',
+  'claude-sonnet-5-5',
+  'claude-opus-5-5',
+];
 
 const OPENAI_MODELS = [
   'gpt-5.3-codex',
@@ -58,7 +67,16 @@ const CLAUDE_MODELS = [
 ];
 
 const DEFAULT_CONFIG = {
-  provider: 'ollama',
+  provider: 'minimax',
+  minimaxUrl: 'https://api.minimaxi.com/v1/chat/completions',
+  minimaxModel: MINIMAX_MODELS[0],
+  minimaxReasoningEffort: 'low',
+  antigravityUrl: 'https://your-openai-proxy.example.com/v1/chat/completions',
+  antigravityModel: ANTIGRAVITY_MODELS[0],
+  antigravityReasoningEffort: 'low',
+  customUrl: 'https://api.openai.com/v1/chat/completions',
+  customModel: 'gpt-4o-mini',
+  customReasoningEffort: 'low',
   openaiModel: OPENAI_MODELS[0],
   openaiReasoningEffort: 'medium',
   geminiModel: GEMINI_MODELS[0],
@@ -403,7 +421,39 @@ const rl = readline.createInterface({
   output: process.stdout,
 });
 
-function ask(question) {
+function ask(question, singleKey = false) {
+  if (singleKey && process.stdin.isTTY) {
+    return new Promise(resolve => {
+      process.stdout.write(question);
+      const wasRaw = process.stdin.isRaw;
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+
+      const onData = buf => {
+        const str = buf.toString('utf8');
+        process.stdin.removeListener('data', onData);
+        process.stdin.setRawMode(Boolean(wasRaw));
+
+        if (str === '\u0003') {
+          process.stdout.write('\nOperation cancelled.\n');
+          if (!rl.closed) rl.close();
+          process.exit(1);
+        }
+
+        if (str === '\r' || str === '\n' || str === ' ' || str.toLowerCase() === 'y') {
+          process.stdout.write('\n');
+          resolve('y');
+          return;
+        }
+
+        process.stdout.write(`${str === '\u001b' ? 'Esc' : str}\n`);
+        resolve('n');
+      };
+
+      process.stdin.on('data', onData);
+    });
+  }
+
   return new Promise(resolve => rl.question(question, resolve));
 }
 
@@ -417,11 +467,8 @@ function resolvePreferredPath(primaryPath, legacyPath) {
   return primaryPath;
 }
 
-function startGenerationLoading(provider) {
-  const message = `Generating command with ${provider}...`;
-
+function startGenerationLoading() {
   if (!process.stdout.isTTY) {
-    console.log(message);
     return {
       stop() {},
     };
@@ -441,11 +488,11 @@ function startGenerationLoading(provider) {
     ) {
       process.stdout.clearLine(0);
       process.stdout.cursorTo(0);
-      process.stdout.write(`${message} ${frame}`);
+      process.stdout.write(`Thinking ${frame}`);
       return;
     }
 
-    process.stdout.write(`\r${message} ${frame}`);
+    process.stdout.write(`\rThinking ${frame}`);
   };
 
   render();
@@ -471,6 +518,10 @@ function startGenerationLoading(provider) {
   };
 }
 
+const CURRENT_SESSION_ID = String(process.ppid || 'default');
+const MAX_CONTEXT_ENTRIES = 10;
+const MAX_OUTPUT_CHARS_PER_ENTRY = 1500;
+
 function saveHistory(entry) {
   let history = [];
   const historyReadPath = resolvePreferredPath(HISTORY_PATH, LEGACY_HISTORY_PATH);
@@ -484,13 +535,76 @@ function saveHistory(entry) {
     }
   }
 
-  history.push({ ...entry, timestamp: new Date().toISOString() });
+  history.push({
+    ...entry,
+    sessionId: entry.sessionId || CURRENT_SESSION_ID,
+    timestamp: new Date().toISOString(),
+  });
 
   try {
     ensureParentDirectory(HISTORY_PATH);
     fs.writeFileSync(HISTORY_PATH, JSON.stringify(history, null, 2));
   } catch (e) {
     console.error('Error writing history file:', e.message);
+  }
+}
+
+function clearCurrentSessionHistory() {
+  const historyReadPath = resolvePreferredPath(HISTORY_PATH, LEGACY_HISTORY_PATH);
+  if (!fs.existsSync(historyReadPath)) return;
+
+  try {
+    const history = JSON.parse(fs.readFileSync(historyReadPath, 'utf-8'));
+    if (!Array.isArray(history)) return;
+    const filtered = history.filter(item => item.sessionId !== CURRENT_SESSION_ID);
+    ensureParentDirectory(HISTORY_PATH);
+    fs.writeFileSync(HISTORY_PATH, JSON.stringify(filtered, null, 2));
+  } catch (e) {
+    console.error('Error clearing session history:', e.message);
+  }
+}
+
+function buildRecentConversationContext(historyReadPath) {
+  if (!fs.existsSync(historyReadPath)) return '';
+
+  try {
+    const history = JSON.parse(fs.readFileSync(historyReadPath, 'utf-8'));
+    if (!Array.isArray(history) || history.length === 0) return '';
+
+    const sessionEntries = history
+      .filter(
+        item =>
+          item &&
+          item.sessionId === CURRENT_SESSION_ID &&
+          item.prompt &&
+          item.command &&
+          item.command !== 'Error generating command'
+      )
+      .slice(-MAX_CONTEXT_ENTRIES);
+
+    if (sessionEntries.length === 0) return '';
+
+    const lines = [
+      `Recent conversation & terminal output in this shell window (last ${sessionEntries.length} turn(s), chronological):`,
+    ];
+
+    sessionEntries.forEach((item, idx) => {
+      lines.push(
+        `[Turn ${idx + 1}] User: ${item.prompt}`,
+        `[Turn ${idx + 1}] Command (${item.executed ? 'executed' : 'not executed'}): ${item.command}`
+      );
+      if (item.output && item.output.trim()) {
+        lines.push(`[Turn ${idx + 1}] Terminal Output:\n${item.output.trim()}`);
+      }
+    });
+
+    lines.push(
+      'Use the conversation and terminal output above as context when the user refers to previous results, PIDs, files, errors, or follow-up actions.'
+    );
+
+    return lines.join('\n');
+  } catch {
+    return '';
   }
 }
 
@@ -623,6 +737,8 @@ Flags:
   --version     Show the package version
 
 Providers:
+  minimax     Uses MiniMax API (e.g. MiniMax-M3.1-Flash-Preview).
+  antigravity Uses Antigravity proxy (e.g. gemini-3.8-flash).
   ollama      Uses local Ollama models (requires ollama installed).
   openai      Uses OpenAI Codex models (requires API key).
   gemini      Uses Google Gemini API models (requires API key).
@@ -928,6 +1044,10 @@ function collectJsonCandidates(text) {
     const braceSlice = trimmed.slice(firstBrace, lastBrace + 1).trim();
     if (braceSlice) {
       candidates.push(braceSlice);
+      const cleanedBraceSlice = braceSlice.replace(/\}\s*\}+$/, '}');
+      if (cleanedBraceSlice !== braceSlice) {
+        candidates.push(cleanedBraceSlice);
+      }
     }
   }
 
@@ -1122,13 +1242,43 @@ function normalizeConfig(rawConfig) {
     config.provider = DEFAULT_CONFIG.provider;
   }
 
-  if (!OPENAI_MODELS.includes(config.openaiModel)) {
+  if (!config.minimaxModel) {
+    config.minimaxModel = DEFAULT_CONFIG.minimaxModel;
+  }
+  if (!config.minimaxReasoningEffort) {
+    config.minimaxReasoningEffort = DEFAULT_CONFIG.minimaxReasoningEffort;
+  }
+  if (!config.minimaxUrl) {
+    config.minimaxUrl = DEFAULT_CONFIG.minimaxUrl;
+  }
+
+  if (!config.antigravityModel) {
+    config.antigravityModel = DEFAULT_CONFIG.antigravityModel;
+  }
+  if (!config.antigravityReasoningEffort) {
+    config.antigravityReasoningEffort = DEFAULT_CONFIG.antigravityReasoningEffort;
+  }
+  if (!config.antigravityUrl) {
+    config.antigravityUrl = DEFAULT_CONFIG.antigravityUrl;
+  }
+
+  if (!config.customModel) {
+    config.customModel = DEFAULT_CONFIG.customModel;
+  }
+  if (!config.customReasoningEffort) {
+    config.customReasoningEffort = DEFAULT_CONFIG.customReasoningEffort;
+  }
+  if (!config.customUrl) {
+    config.customUrl = DEFAULT_CONFIG.customUrl;
+  }
+
+  if (!config.openaiModel) {
     config.openaiModel = DEFAULT_CONFIG.openaiModel;
   }
-  if (!GEMINI_MODELS.includes(config.geminiModel)) {
+  if (!config.geminiModel) {
     config.geminiModel = DEFAULT_CONFIG.geminiModel;
   }
-  if (!CLAUDE_MODELS.includes(config.claudeModel)) {
+  if (!config.claudeModel) {
     config.claudeModel = DEFAULT_CONFIG.claudeModel;
   }
 
@@ -1836,6 +1986,144 @@ async function generateCommandOllama(
   }
 }
 
+async function generateCommandChatCompletions(
+  providerName,
+  endpointUrl,
+  userPrompt,
+  osInfo,
+  shellInfo,
+  commandAvailabilityContext,
+  apiKey,
+  model,
+  reasoningEffort,
+  explainMode
+) {
+  const systemInstruction = buildSystemInstruction(
+    osInfo,
+    shellInfo,
+    explainMode,
+    commandAvailabilityContext
+  );
+
+  const payload = {
+    model,
+    messages: [
+      {
+        role: 'system',
+        content: systemInstruction,
+      },
+      {
+        role: 'user',
+        content: userPrompt,
+      },
+    ],
+    max_tokens: explainMode ? 1200 : 400,
+  };
+
+  if (reasoningEffort) {
+    payload.reasoning_effort = reasoningEffort;
+  }
+
+  const response = await fetch(endpointUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const message =
+      data?.error?.message ||
+      `${providerName} API request failed: ${response.status} ${response.statusText}`;
+    throw new Error(message);
+  }
+
+  const rawOutput = extractOpenAIText(data);
+
+  if (!rawOutput) {
+    throw new Error(`${providerName} API returned an empty response.`);
+  }
+
+  return rawOutput;
+}
+
+async function configureMinimax(config) {
+  console.log('\nConfiguring MiniMax provider.');
+
+  config.minimaxApiKey = await promptApiKey(
+    'MiniMax',
+    config.minimaxApiKey || ''
+  );
+  config.minimaxModel = await promptChoice(
+    'MiniMax model',
+    MINIMAX_MODELS,
+    config.minimaxModel
+  );
+  config.minimaxReasoningEffort = await promptChoice(
+    'MiniMax reasoning effort',
+    ['low', 'medium', 'high', 'xhigh', 'max'],
+    config.minimaxReasoningEffort
+  );
+}
+
+async function configureAntigravity(config) {
+  console.log('\nConfiguring Antigravity / OpenAI-compatible proxy provider.');
+
+  const urlInput = (
+    await ask(
+      `Endpoint URL [${config.antigravityUrl || DEFAULT_CONFIG.antigravityUrl}]: `
+    )
+  ).trim();
+  if (urlInput) {
+    config.antigravityUrl = urlInput;
+  }
+
+  config.antigravityApiKey = await promptApiKey(
+    'Antigravity',
+    config.antigravityApiKey || ''
+  );
+  config.antigravityModel = await promptChoice(
+    'Antigravity model',
+    ANTIGRAVITY_MODELS,
+    config.antigravityModel
+  );
+  config.antigravityReasoningEffort = await promptChoice(
+    'Antigravity reasoning effort',
+    ['low', 'medium', 'high'],
+    config.antigravityReasoningEffort
+  );
+}
+
+async function configureCustom(config) {
+  console.log('\nConfiguring Custom OpenAI-compatible provider.');
+
+  const urlInput = (
+    await ask(`Endpoint URL [${config.customUrl || DEFAULT_CONFIG.customUrl}]: `)
+  ).trim();
+  if (urlInput) {
+    config.customUrl = urlInput;
+  }
+
+  config.customApiKey = await promptApiKey('Custom', config.customApiKey || '');
+
+  const modelInput = (
+    await ask(`Model name [${config.customModel || DEFAULT_CONFIG.customModel}]: `)
+  ).trim();
+  if (modelInput) {
+    config.customModel = modelInput;
+  }
+
+  config.customReasoningEffort = await promptChoice(
+    'Reasoning effort',
+    ['low', 'medium', 'high', 'xhigh', 'max'],
+    config.customReasoningEffort
+  );
+}
+
 async function configureOpenAI(config) {
   console.log('\nConfiguring OpenAI provider.');
   console.log(
@@ -1941,6 +2229,21 @@ async function configureOllama(config) {
 }
 
 async function configureProviderSettings(config) {
+  if (config.provider === 'custom') {
+    await configureCustom(config);
+    return;
+  }
+
+  if (config.provider === 'minimax') {
+    await configureMinimax(config);
+    return;
+  }
+
+  if (config.provider === 'antigravity') {
+    await configureAntigravity(config);
+    return;
+  }
+
   if (config.provider === 'openai') {
     await configureOpenAI(config);
     return;
@@ -1965,6 +2268,15 @@ async function configureProviderSettings(config) {
 }
 
 function summarizeProvider(config) {
+  if (config.provider === 'custom') {
+    return `Provider: custom | Model: ${config.customModel} | Reasoning effort: ${config.customReasoningEffort}`;
+  }
+  if (config.provider === 'minimax') {
+    return `Provider: minimax | Model: ${config.minimaxModel} | Reasoning effort: ${config.minimaxReasoningEffort}`;
+  }
+  if (config.provider === 'antigravity') {
+    return `Provider: antigravity | Model: ${config.antigravityModel} | Reasoning effort: ${config.antigravityReasoningEffort}`;
+  }
   if (config.provider === 'openai') {
     return `Provider: openai | Model: ${config.openaiModel} | Reasoning effort: ${config.openaiReasoningEffort}`;
   }
@@ -1988,6 +2300,66 @@ async function generateWithConfiguredProvider(
   commandAvailabilityContext,
   explainMode
 ) {
+  if (config.provider === 'custom') {
+    if (!config.customApiKey) {
+      throw new Error(
+        'Missing API key for provider "custom". Run "ai config" first.'
+      );
+    }
+    return generateCommandChatCompletions(
+      'Custom',
+      config.customUrl,
+      userPrompt,
+      osInfo,
+      shellInfo,
+      commandAvailabilityContext,
+      config.customApiKey,
+      config.customModel,
+      config.customReasoningEffort,
+      explainMode
+    );
+  }
+
+  if (config.provider === 'minimax') {
+    if (!config.minimaxApiKey) {
+      throw new Error(
+        'Missing MiniMax API key for provider "minimax". Run "ai config" first.'
+      );
+    }
+    return generateCommandChatCompletions(
+      'MiniMax',
+      config.minimaxUrl,
+      userPrompt,
+      osInfo,
+      shellInfo,
+      commandAvailabilityContext,
+      config.minimaxApiKey,
+      config.minimaxModel,
+      config.minimaxReasoningEffort,
+      explainMode
+    );
+  }
+
+  if (config.provider === 'antigravity') {
+    if (!config.antigravityApiKey) {
+      throw new Error(
+        'Missing Antigravity API key for provider "antigravity". Run "ai config" first.'
+      );
+    }
+    return generateCommandChatCompletions(
+      'Antigravity',
+      config.antigravityUrl,
+      userPrompt,
+      osInfo,
+      shellInfo,
+      commandAvailabilityContext,
+      config.antigravityApiKey,
+      config.antigravityModel,
+      config.antigravityReasoningEffort,
+      explainMode
+    );
+  }
+
   if (config.provider === 'openai') {
     if (!config.openaiApiKey) {
       throw new Error(
@@ -2161,6 +2533,13 @@ async function main() {
     return;
   }
 
+  if (args[0] === 'clear' || args[0] === 'reset') {
+    clearCurrentSessionHistory();
+    console.log('Current terminal context cleared.');
+    rl.close();
+    return;
+  }
+
   if (args[0] === 'history') {
     if (!fs.existsSync(historyReadPath)) {
       console.log('No command history found.');
@@ -2200,9 +2579,14 @@ async function main() {
   const filteredArgs = args.filter(arg => !['--explain', '--dry'].includes(arg));
   const userPrompt = filteredArgs.join(' ');
   const osInfo = `${os.platform()} ${os.release()} (${os.arch()})`;
-  const shellInfo = process.env.SHELL
-    ? path.basename(process.env.SHELL)
-    : 'sh, zsh, ksh, etc';
+  const shellInfo =
+    process.platform === 'win32'
+      ? process.env.PSModulePath
+        ? 'PowerShell (Windows)'
+        : 'cmd.exe (Windows)'
+      : process.env.SHELL
+      ? path.basename(process.env.SHELL)
+      : 'sh, zsh, ksh, etc';
   let commandAvailabilityContext = '';
 
   if (!userPrompt) {
@@ -2217,6 +2601,14 @@ async function main() {
     console.warn(
       `Warning: Could not gather local command inventory (${error.message}). Continuing without it.`
     );
+  }
+
+  const recentConversationContext =
+    buildRecentConversationContext(historyReadPath);
+  if (recentConversationContext) {
+    commandAvailabilityContext = commandAvailabilityContext
+      ? `${commandAvailabilityContext}\n\n${recentConversationContext}`
+      : recentConversationContext;
   }
 
   let rawModelOutput = '';
@@ -2249,16 +2641,12 @@ async function main() {
 
   const { explanation, command } = parseModelOutput(rawModelOutput, explainMode);
 
-  console.log(`\nAI Response (Provider: ${executedProvider}):`);
-
   if (explainMode && explanation) {
     console.log('\n--- Explanation ---');
     console.log(explanation);
   }
 
-  console.log('\n--- Proposed Command ---');
-  console.log(command);
-  console.log('----------------------');
+  console.log(`\n> ${command}`);
 
   if (!command || command.trim() === '') {
     console.error('\nCould not extract a valid command from the AI response.');
@@ -2292,14 +2680,15 @@ async function main() {
 
   const confirm = await ask(
     dryRun
-      ? '\n[Dry run] Press ENTER to simulate execution, or Ctrl+C to cancel: '
-      : '\nDo you want to run the proposed command(s)? (Y/n): '
+      ? '[Dry run] Press ENTER to simulate (or n/Esc to cancel): '
+      : 'Press ENTER to run (or n/Esc to cancel): ',
+    true
   );
   const shouldRun =
     confirm.trim() === '' || confirm.trim().toLowerCase() === 'y';
 
   if (!shouldRun) {
-    console.log('Operation cancelled.');
+    console.log('Cancelled.');
     saveHistory({
       prompt: userPrompt,
       command,
@@ -2312,7 +2701,7 @@ async function main() {
   }
 
   if (dryRun) {
-    console.log('\n[Dry run] Command not executed.');
+    console.log('[Dry run] Command not executed.');
     saveHistory({
       prompt: userPrompt,
       command,
@@ -2326,7 +2715,6 @@ async function main() {
 
   rl.close();
 
-  console.log('\nExecuting command...');
   if (supportsExecveHandoff()) {
     const shellPath = resolveExecutionShell();
     const shellArgv0 = path.basename(shellPath) || shellPath;
@@ -2347,37 +2735,64 @@ async function main() {
       return;
     } catch (error) {
       removeLastHistoryEntryByNoteToken(handoffToken);
-      console.warn(
-        `\nexecve handoff failed (${error.message}). Falling back to child_process.exec.`
-      );
     }
   }
 
-  exec(command, (error, stdout, stderr) => {
-    if (error) {
-      console.error(`\nExecution error:\n${error.message}`);
-      saveHistory({
-        prompt: userPrompt,
-        command,
-        executed: false,
-        provider: executedProvider,
-        notes: `Execution failed: ${error.message}`,
-      });
-      return;
-    }
+  const child = spawn(command, {
+    stdio: ['inherit', 'pipe', 'pipe'],
+    shell:
+      process.platform === 'win32' && process.env.PSModulePath
+        ? 'powershell.exe'
+        : true,
+  });
 
-    if (stdout) console.log(`\nStdout:\n${stdout}`);
-    if (stderr) console.error(`\nStderr:\n${stderr}`);
-    if (!stdout && !stderr) {
-      console.log('\nCommand executed successfully with no output.');
+  let capturedOutput = '';
+  const appendCaptured = chunk => {
+    const text = stripAnsi(chunk.toString());
+    capturedOutput += text;
+    if (capturedOutput.length > MAX_OUTPUT_CHARS_PER_ENTRY * 2) {
+      capturedOutput = capturedOutput.slice(-MAX_OUTPUT_CHARS_PER_ENTRY);
     }
+  };
 
+  if (child.stdout) {
+    child.stdout.on('data', chunk => {
+      process.stdout.write(chunk);
+      appendCaptured(chunk);
+    });
+  }
+
+  if (child.stderr) {
+    child.stderr.on('data', chunk => {
+      process.stderr.write(chunk);
+      appendCaptured(chunk);
+    });
+  }
+
+  child.on('error', error => {
+    console.error(`\nExecution error:\n${error.message}`);
     saveHistory({
       prompt: userPrompt,
       command,
-      executed: true,
+      output: capturedOutput.slice(-MAX_OUTPUT_CHARS_PER_ENTRY),
+      executed: false,
       provider: executedProvider,
+      notes: `Execution failed: ${error.message}`,
     });
+  });
+
+  child.on('exit', code => {
+    saveHistory({
+      prompt: userPrompt,
+      command,
+      output: capturedOutput.slice(-MAX_OUTPUT_CHARS_PER_ENTRY),
+      executed: code === 0,
+      provider: executedProvider,
+      notes: code && code !== 0 ? `Exited with code ${code}` : undefined,
+    });
+    if (code && code !== 0) {
+      process.exitCode = code;
+    }
   });
 }
 
