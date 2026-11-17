@@ -454,6 +454,10 @@ function ask(question, singleKey = false) {
     });
   }
 
+  if (rl.closed) {
+    return Promise.resolve('');
+  }
+
   return new Promise(resolve => rl.question(question, resolve));
 }
 
@@ -646,6 +650,22 @@ function resolveExecutionShell() {
   }
 
   return '/bin/sh';
+}
+
+function isShellStateCommand(command) {
+  const trimmed = (command || '').trim();
+  if (!trimmed) return false;
+
+  const segments = trimmed
+    .split(/(?:&&|\|\||;|\r?\n)+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  return segments.some(seg =>
+    /^(?:cd(?:[.\\/\s]|$)|chdir\b|set-location\b|sl\b|push-location\b|pushd\b|pop-location\b|popd\b|cls\b|clear\b|clear-host\b|\$env:[a-z0-9_]+\s*=|set\s+[a-z0-9_]+\s*=|set-item\s+env:|remove-item\s+env:|conda\s+(?:activate|deactivate)\b|[a-z]:$|.*activate\.ps1\b)/i.test(
+      seg
+    )
+  );
 }
 
 function isDangerous(command) {
@@ -1302,10 +1322,15 @@ function buildSystemInstruction(
 ${commandAvailabilityContext}`
     : '';
 
+  const envInstruction = shellInfo.toLowerCase().includes('powershell')
+    ? 'Environment rules: The user is currently in Windows PowerShell (default Windows PowerShell 5.1 compatible syntax). Always generate valid Windows PowerShell commands (e.g. Set-Location, Get-ChildItem, Select-String, $HOME, $env:VAR, ";" for command chaining instead of "&&"). Do NOT output Linux/bash-only syntax.'
+    : '';
+
   return `
 You are a helpful shell (${shellInfo}) assistant, running on ${osInfo}.
 The user will ask for a task they want to accomplish or need help with.
 Your goal is to provide safe and correct shell command(s) to accomplish that task.
+${envInstruction}
 ${modeInstruction}
 ${outputShapeInstruction}
 ${commandAvailabilityInstruction}
@@ -2581,9 +2606,9 @@ async function main() {
   const osInfo = `${os.platform()} ${os.release()} (${os.arch()})`;
   const shellInfo =
     process.platform === 'win32'
-      ? process.env.PSModulePath
-        ? 'PowerShell (Windows)'
-        : 'cmd.exe (Windows)'
+      ? (process.env.CMD_AI_SHELL_EXEC_FILE || '').toLowerCase().endsWith('.bat')
+        ? 'cmd.exe (Windows)'
+        : 'Windows PowerShell'
       : process.env.SHELL
       ? path.basename(process.env.SHELL)
       : 'sh, zsh, ksh, etc';
@@ -2714,6 +2739,27 @@ async function main() {
   }
 
   rl.close();
+
+  const shellExecFile = (process.env.CMD_AI_SHELL_EXEC_FILE || '').trim();
+  if (shellExecFile && isShellStateCommand(command)) {
+    try {
+      ensureParentDirectory(shellExecFile);
+      fs.writeFileSync(shellExecFile, command, 'utf-8');
+      saveHistory({
+        prompt: userPrompt,
+        command,
+        output: `[Executed in parent shell: ${command}]`,
+        executed: true,
+        provider: executedProvider,
+        notes: 'Delegated to parent shell session',
+      });
+      return;
+    } catch (error) {
+      console.warn(
+        `Warning: Could not hand off command to parent shell (${error.message}). Falling back to child execution.`
+      );
+    }
+  }
 
   if (supportsExecveHandoff()) {
     const shellPath = resolveExecutionShell();
